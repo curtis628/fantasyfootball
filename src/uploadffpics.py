@@ -1,119 +1,147 @@
 #!/usr/bin/env python
 
-import os
-import sys
+"""
+This script helps upload custom images stored on disk to a public location on imgur.com, and
+generates a helpful template to use for the basis of an ESPN fantasy football league note.
+"""
+
 import argparse
-import glob
-import pprint
+import base64
+import json
+import logging
+import os
 
-from dropbox import client, rest
+from datetime import datetime
+from collections import namedtuple
 
-# XXX Fill in your consumer key and secret below
-# You can find these at http://www.dropbox.com/developers/apps
-APP_KEY = 'jxaiq7pb3ewondu'
-APP_SECRET = 'mkxkohh6r3tpuna'
+import requests
 
-class DropboxClient():
-    TOKEN_FILE = "token_store.txt"
+
+logger = logging.getLogger(__name__)
+
+# container to hold values that are passed between methods
+Config = namedtuple(
+    "Config",
+    [
+        "access_token",
+        "client_id",
+        "upload_folder",
+        "description",
+    ])
+
+
+def _get_response_json(response):
+    """Helper method that ensures response is successful, and returns JSON dict"""
+    logger.debug("%s resulted in [status=%s]:\nbody:%s",
+                 response.url, response.status_code, response.text)
+    if not response.ok:
+        logger.error("%s failed with [status=%s]\nbody: %s",
+                     response.url, response.status_code, response.text)
+    response.raise_for_status() # raise exception if API call failed for some reason
+    return response.json()      # return JSON dict of the response
+
+
+def _get_access_token(args):
+    """Generates a new Imgur access token to use for interacting with the Imgur API"""
+    url = "https://api.imgur.com/oauth2/token"
+    data = dict(
+            refresh_token=args.refresh_token,
+            client_id=args.client_id,
+            client_secret=args.client_secret,
+            grant_type="refresh_token")
+    headers = {"content-type": "application/json"}
+    response = requests.request("POST", url, data=json.dumps(data), headers=headers)
+    response_dict = _get_response_json(response)
+    logger.info("Retrieved access token for [username=%s]", response_dict["account_username"])
+    return response_dict["access_token"]
+
+def _create_album(config):
+    """Creates a new BandOfBrothers Imgur album based on today's date"""
+    album_name = "BandOfBrothers-{:%Y-%m-%d}".format(datetime.now())
+    logger.debug("Creating [album=%s]", album_name)
     
-    def __init__(self, app_key, app_secret, current_path="Public/FantasyFootball"):
-        self.app_key = app_key
-        self.app_secret = app_secret
-        self.api_client = None
-        self.current_path = current_path
+    url = "https://api.imgur.com/3/album"
+    data = dict(
+            title=album_name,
+            description=config.description)
+    headers = {
+            "content-type": "application/json",
+            "Authorization": "Bearer " + config.access_token
+            }
+    response = requests.request("POST", url, data=json.dumps(data), headers=headers)
+    response_dict = _get_response_json(response)
+    album_id = response_dict["data"]["id"]
+    logger.info("Successfully created album [name=%s] with [id=%s]", album_name, album_id)
+    return album_id
 
-        try:
-            token = open(self.TOKEN_FILE).read()
-            self.api_client = client.DropboxClient(token)
-            print("[loaded access token]")
-        except IOError:
-            pass # don't worry if it's not there
 
-    def login(self):
-        """log in to a Dropbox account"""
-        flow = client.DropboxOAuth2FlowNoRedirect(self.app_key, self.app_secret)
-        authorize_url = flow.start()
-        sys.stdout.write("1. Go to: " + authorize_url + "\n")
-        sys.stdout.write("2. Click \"Allow\" (you might have to log in first).\n")
-        sys.stdout.write("3. Copy the authorization code.\n")
-        code = raw_input("Enter the authorization code here: ").strip()
+def _upload_images(config, album_id):
+    """Uploads files from upload_folder to Imgur (and associate with album_id). Returns links."""
+    logger.info("Uploading files in %s using [album_id=%s]", args.upload_folder, album_id)
+    url = "https://api.imgur.com/3/image"
+    headers = {
+            "content-type": "application/json",
+            "Authorization": "Bearer " + config.access_token
+            }
 
-        try:
-            access_token, user_id = flow.finish(code)
-        except rest.ErrorResponse as e:
-            self.stdout.write('Error: %s\n' % str(e))
-            return
+    # We want to upload the files in the same order as their filename. This List Comprehension:
+    #  * list all files in upload_folder
+    #  * sorts them by filename
+    #  * stores the full path of each file in sorted_filenames
+    sorted_filenames = [
+            os.path.join(config.upload_folder, f) for f in sorted(os.listdir(config.upload_folder))
+    ]
+    imgur_links = [] # Stores (in sorted order) the public URL for each image uploaded to Imgur
+    for path in sorted_filenames:
+        with open(path, "rb") as f:  # open image in read-only + binary mode
+            image_data = f.read()    # read in our image file and then base64 encode it
+            b64_image = base64.standard_b64encode(image_data)
+            filename = os.path.basename(path)
+            data = {
+                    "image": b64_image.decode("UTF-8"),
+                    "title": filename,
+                    "name": filename,
+                    "album": album_id}
+            response = requests.request("POST", url, data=json.dumps(data), headers=headers)
+            response_dict = _get_response_json(response)
+            link = response_dict["data"]["link"]
+            logger.info("Successfully uploaded %s to Imgur: %s", path, link)
+            imgur_links.append(link)
 
-        with open(self.TOKEN_FILE, 'w') as f:
-            f.write(access_token)
-        self.api_client = client.DropboxClient(access_token)
-        
-        print("Login successful! userId = ", user_id)
+    logger.info("Successfully uploaded %s files: %s", len(imgur_links), imgur_links)
+    return imgur_links
 
-    def logout(self):
-        """log out of the current Dropbox account"""
-        self.api_client = None
-        os.unlink(self.TOKEN_FILE)
-        self.current_path = ''
-        print("Logout successful!")
-        
-    def print_metadata(self, path):
-        """prints Dropbox metadata for all items in 'path', including ESPN fantasy football syntax"""
-        folder_metadata = self.api_client.metadata(self.current_path + "/" + path)
-        account_info = self.api_client.account_info()
-        uid = account_info['uid']
-        
-        metadata = "[center][image]http://dl.dropboxusercontent.com/u/{uid}/{filePath}[/image]\n\n[/center]\n"
-        for file in folder_metadata['contents']:
-            dropboxPath = file['path']
-            print(metadata.format(uid=uid, filePath=dropboxPath[8:]))
-        
-    def print_account_info(self):
-        """display account information"""
-        f = self.api_client.account_info()
-        pprint.PrettyPrinter(indent=2).pprint(f)
+def _print_template(config, imgur_links):
+    """Generates initial ESPN league note template based on imgur_links"""
+    logging.info("Use the ESPN league note template below as a starting place...")
+    if config.description:
+        print(config.description + "\n")
+    for ndx in range(len(imgur_links)):
+        print("%s. " % (ndx+1)) # NOTE: Ordering 1-N; could change 'range` to be descending if needed
+        print("[center][image]%s[/image]" % imgur_links[ndx]) # Use ESPN markup to center public image
+        print("[/center]")
+        print("\n")
 
-    def put(self, from_path, to_path):
-        """
-        Copy local file to Dropbox
+def _main(config):
+    album_id = _create_album(config)
+    imgur_links = _upload_images(config, album_id)
+    _print_template(config, imgur_links)
 
-        Examples:
-        Dropbox> put ~/test.txt dropbox-copy-test.txt
-        """
-        
-        from_file = open(os.path.expanduser(from_path), "rb")
-		
-        print("Uploading file from [{}] to Dropbox [{}]".format(from_path, to_path))
-        self.api_client.put_file(self.current_path + "/" + to_path, from_file)
 
-def main(folder, projectName, skipUpload=None):
-    if APP_KEY == '' or APP_SECRET == '':
-        exit("You need to set your APP_KEY and APP_SECRET!")
-    client = DropboxClient(APP_KEY, APP_SECRET)
-    
-    if (client.api_client == None):
-        client.login()
-
-    if not skipUpload:
-        files = os.listdir(folder)
-        for file in files:
-            client.put(folder + "/" + file, projectName + "/" + file)
-    
-    client.print_metadata(projectName)
-    
-    #client.logout()
-    
-
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description="This program uploads all items of a specified folder to a public Dropbox folder")
-    parser.add_argument("folder",
-    					help="the path to the folder to upload to Dropbox")
-    parser.add_argument("projectName",
-    					help="the name of the project (ie: leagueNote). The program will create this 'projectName' folder within Dropbox")
-    parser.add_argument("-skipUpload", 
-						help="Don't upload the folder; just print out the metadata of the folder on Dropbox",
-						action="store_true")
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Facilitates image upload and formatting for league notes")
+    parser.add_argument("client_id", help="The Client Id to use for Imgur's API calls")
+    parser.add_argument("client_secret", help="The Client Secret to use for Imgur's API calls")
+    parser.add_argument("refresh_token", help="The refresh token to use for Imgur's API calls")
+    parser.add_argument("upload_folder", help="The path to the folder containing images to upload")
+    parser.add_argument("--description", help="Optional description for the album/template")
     
     args = parser.parse_args()
-    print("Parsed args: ",	args)
-    main(args.folder, args.projectName, args.skipUpload)
+    logging.basicConfig(level=logging.INFO)
+    access_token = _get_access_token(args)
+    config = Config(
+        access_token=access_token,
+        client_id=args.client_id,
+        upload_folder=args.upload_folder,
+        description=args.description)
+    _main(config)
